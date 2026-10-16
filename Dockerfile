@@ -3,17 +3,23 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install LibreOffice headless, Poppler utilities, and Unicode fonts for perfect formatting & language support
+# Install LibreOffice headless, Poppler utilities, fontconfig, and complete metric-compatible fonts for 100% exact layout matching
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \
     poppler-utils \
-    fonts-dejavu \
+    fontconfig \
     fonts-liberation \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-dejavu \
+    fonts-freefont-ttf \
     fonts-noto \
     fonts-noto-cjk \
+    gsfonts \
+    && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
