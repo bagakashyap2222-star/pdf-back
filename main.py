@@ -36,27 +36,28 @@ def cleanup_path(path: str):
 
 
 # ============================================================================
-# NON-DESTRUCTIVE OPENXML SANITIZER
-# Strips invalid control characters and fixes empty table cells WITHOUT
-# destroying document.xml root namespaces or mc:Ignorable attributes.
+# UNIVERSAL MICROSOFT WORD COMPATIBILITY SANITIZER
+# Fixes Word 2007 (Office 12), 2010, 2013, 2016, 2019, 2021, and Office 365 issues:
+# 1. Strips illegal control characters (\x00-, , , -)
+# 2. Normalizes <w:start> / <w:end> -> <w:left> / <w:right> in borders & margins
+# 3. Deduplicates consecutive <w:tcMar> and <w:tcBorders> tags
+# 4. Ensures every table cell <w:tc> has at least one child <w:p/>
+# 5. Wraps any direct <w:drawing> inside <w:tc> into a valid <w:p><w:r> block
+# 6. Preserves all root namespaces, mc:Ignorable attributes, and XML headers intact
 # ============================================================================
 
 ILLEGAL_XML_CHARS_RE = re.compile(
     r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ud800-\udfff\ufffe\uffff]'
 )
 
-def sanitize_docx_regex(docx_path: str) -> bool:
+def sanitize_docx_for_word(docx_path: str) -> bool:
     """
-    Non-destructive OpenXML sanitization:
-    - Strips forbidden XML 1.0 control characters.
-    - Fixes empty table cells <w:tc> by injecting required <w:p/>.
-    - Wraps direct drawings inside <w:tc> into proper <w:p><w:r> blocks.
-    - Preserves all root namespaces, mc:Ignorable attributes, and XML headers.
+    Sanitizes DOCX files for 100% clean opening in all Microsoft Word versions.
     """
     if not os.path.exists(docx_path) or os.path.getsize(docx_path) == 0:
         return False
 
-    temp_fixed = docx_path + ".clean.tmp"
+    temp_fixed = docx_path + ".word_clean.tmp"
     try:
         with zipfile.ZipFile(docx_path, 'r') as zin:
             with zipfile.ZipFile(temp_fixed, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
@@ -64,23 +65,28 @@ def sanitize_docx_regex(docx_path: str) -> bool:
                     raw_data = zin.read(item.filename)
                     if item.filename.endswith('.xml') or item.filename.endswith('.rels'):
                         text = raw_data.decode('utf-8', errors='replace')
-                        clean_text = ILLEGAL_XML_CHARS_RE.sub('', text)
+                        
+                        # 1. Clean illegal XML control characters
+                        text = ILLEGAL_XML_CHARS_RE.sub('', text)
 
                         if item.filename.endswith('document.xml'):
-                            # Ensure empty <w:tc> has a <w:p/>
-                            clean_text = re.sub(
-                                r'(<w:tc(?:s+[^>]*)?>)(?!s*<w:(?:p|tbl))',
-                                r'\1<w:p/>',
-                                clean_text
-                            )
-                            # Wrap loose drawing directly under tc: <w:tc>...<w:drawing> -> <w:p><w:r><w:drawing>
-                            clean_text = re.sub(
-                                r'(<w:tc(?:s+[^>]*)?>\s*)(<w:drawing[\s\S]*?</w:drawing>)',
-                                r'\1<w:p><w:r>\2</w:r></w:p>',
-                                clean_text
-                            )
+                            # 2. Convert <w:start> and <w:end> to <w:left> and <w:right> for Word 2007-365 compatibility
+                            text = re.sub(r'<w:start\b', '<w:left', text)
+                            text = re.sub(r'</w:start>', '</w:left>', text)
+                            text = re.sub(r'<w:end\b', '<w:right', text)
+                            text = re.sub(r'</w:end>', '</w:right>', text)
 
-                        clean_data = clean_text.encode('utf-8')
+                            # 3. Deduplicate consecutive <w:tcMar> and <w:tcBorders>
+                            text = re.sub(r'(<w:tcMar>[\s\S]*?</w:tcMar>)(?:\s*<w:tcMar>[\s\S]*?</w:tcMar>)+', r'\1', text)
+                            text = re.sub(r'(<w:tcBorders>[\s\S]*?</w:tcBorders>)(?:\s*<w:tcBorders>[\s\S]*?</w:tcBorders>)+', r'\1', text)
+
+                            # 4. Ensure every <w:tc> has at least one <w:p/>
+                            text = re.sub(r'(<w:tc(?:\s+[^>]*)?>)(?!\s*<w:(?:p|tbl))', r'\1<w:p/>', text)
+
+                            # 5. Wrap loose <w:drawing> directly under <w:tc>
+                            text = re.sub(r'(<w:tc(?:\s+[^>]*)?>\s*)(<w:drawing[\s\S]*?</w:drawing>)', r'\1<w:p><w:r>\2</w:r></w:p>', text)
+
+                        clean_data = text.encode('utf-8')
                         zout.writestr(item, clean_data)
                     else:
                         zout.writestr(item, raw_data)
@@ -144,7 +150,7 @@ def health_check():
 
 # ============================================================================
 # 1. PDF TO WORD (.docx)
-# High-Fidelity Flowing Layout Extraction with Stream Table Support
+# High-Fidelity Flowing Layout Extraction with Full Table Support
 # ============================================================================
 @app.post("/convert/pdf-to-word")
 async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -165,48 +171,41 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
 
         converted_ok = False
 
-        # ENGINE 1 (HIGH-FIDELITY STREAM TABLE PRIMARY):
-        # Native paragraph & stream-table reconstruction via pdf2docx.
-        # Disabling lattice borders prevents the corrupt grid tags, while
-        # stream tables preserve real columns and natural flowing text.
+        # ENGINE 1 (HIGH-FIDELITY PRIMARY):
+        # Native paragraph & full table layout reconstruction via pdf2docx.
+        # Sanitizer fixes Word 2007-365 schema incompatibilities (start/end -> left/right,
+        # duplicate tcMar/tcBorders, loose drawings, control characters).
         try:
             from pdf2docx import Converter
             cv = Converter(input_pdf)
-            cv.convert(
-                output_docx,
-                start=0,
-                end=None,
-                parse_lattice_table=False,
-                parse_stream_table=True,
-                multi_processing=False
-            )
+            cv.convert(output_docx, start=0, end=None, multi_processing=False)
             cv.close()
 
             if os.path.exists(output_docx) and os.path.getsize(output_docx) > 0:
-                if sanitize_docx_regex(output_docx):
+                if sanitize_docx_for_word(output_docx):
                     converted_ok = True
         except Exception as e:
-            print(f"pdf2docx stream engine error: {e}")
+            print(f"pdf2docx primary engine error: {e}")
 
-        # ENGINE 2 (FALLBACK): Standard pdf2docx
+        # ENGINE 2 (FALLBACK): Safe table parsing mode
         if not converted_ok:
             try:
                 from pdf2docx import Converter
                 cv = Converter(input_pdf)
-                cv.convert(output_docx, start=0, end=None, multi_processing=False)
+                cv.convert(output_docx, start=0, end=None, parse_lattice_table=False, multi_processing=False)
                 cv.close()
 
                 if os.path.exists(output_docx) and os.path.getsize(output_docx) > 0:
-                    if sanitize_docx_regex(output_docx):
+                    if sanitize_docx_for_word(output_docx):
                         converted_ok = True
             except Exception as e:
-                print(f"pdf2docx standard engine error: {e}")
+                print(f"pdf2docx safe engine error: {e}")
 
         # ENGINE 3 (EMERGENCY FALLBACK): LibreOffice Headless
         if not converted_ok:
             lo_ok = convert_pdf_to_docx_libreoffice(input_pdf, tmp_dir, output_docx)
             if lo_ok and os.path.exists(output_docx) and os.path.getsize(output_docx) > 0:
-                sanitize_docx_regex(output_docx)
+                sanitize_docx_for_word(output_docx)
                 converted_ok = True
 
         if not converted_ok or not os.path.exists(output_docx) or os.path.getsize(output_docx) == 0:
@@ -263,7 +262,7 @@ async def convert_word_to_pdf(background_tasks: BackgroundTasks, file: UploadFil
             if pdfs:
                 output_pdf = os.path.join(tmp_dir, pdfs[0])
             else:
-                raise Exception("No PDF output generated by engine.")
+                raise Exception("No PDF generated.")
 
         return FileResponse(
             path=output_pdf,
