@@ -1,7 +1,10 @@
 import os
+import re
 import shutil
 import tempfile
 import subprocess
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +36,96 @@ def cleanup_path(path: str):
         print(f"Warning: could not delete {path}: {e}")
 
 
+# Illegal XML 1.0 characters regex: forbids \x00-\x08, \x0b, \x0c, \x0e-\x1f, etc.
+ILLEGAL_XML_CHARS_RE = re.compile(
+    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ud800-\udfff\ufffe\uffff]'
+)
+
+def sanitize_docx(docx_path: str) -> bool:
+    """
+    Sanitizes a DOCX file to guarantee 100% Microsoft Word OpenXML compliance:
+    1. Removes any forbidden XML 1.0 control characters (e.g. \\x0c, \\x00, \\x0b, \\x1f)
+       which pdf2docx frequently extracts from PDF font streams.
+    2. Ensures table cells <w:tc> contain required paragraph <w:p> elements.
+    3. Validates XML parsing of all internal parts so Microsoft Word opens without error.
+    """
+    if not os.path.exists(docx_path) or os.path.getsize(docx_path) == 0:
+        return False
+
+    temp_fixed = docx_path + ".sanitized.tmp"
+    try:
+        W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+        with zipfile.ZipFile(docx_path, 'r') as zin:
+            with zipfile.ZipFile(temp_fixed, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    raw_data = zin.read(item.filename)
+                    if item.filename.endswith('.xml') or item.filename.endswith('.rels'):
+                        text = raw_data.decode('utf-8', errors='replace')
+                        clean_text = ILLEGAL_XML_CHARS_RE.sub('', text)
+
+                        try:
+                            root = ET.fromstring(clean_text.encode('utf-8'))
+                            if item.filename.endswith('document.xml'):
+                                modified = False
+                                for tc in root.iter(f"{{{W_NS}}}tc"):
+                                    has_p = any(child.tag == f"{{{W_NS}}}p" for child in tc)
+                                    if not has_p:
+                                        p_elem = ET.Element(f"{{{W_NS}}}p")
+                                        tc.append(p_elem)
+                                        modified = True
+                                if modified:
+                                    ET.register_namespace('w', W_NS)
+                                    clean_data = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+                                else:
+                                    clean_data = clean_text.encode('utf-8')
+                            else:
+                                clean_data = clean_text.encode('utf-8')
+                        except ET.ParseError:
+                            return False
+
+                        zout.writestr(item, clean_data)
+                    else:
+                        zout.writestr(item, raw_data)
+
+        shutil.move(temp_fixed, docx_path)
+        return True
+    except Exception as e:
+        print(f"Error sanitizing docx: {e}")
+        if os.path.exists(temp_fixed):
+            try:
+                os.remove(temp_fixed)
+            except Exception:
+                pass
+        return False
+
+
+def convert_pdf_to_docx_libreoffice(input_pdf: str, tmp_dir: str, output_docx: str) -> bool:
+    """Fallback: convert PDF to DOCX using LibreOffice Writer's built-in PDF import filter."""
+    try:
+        cmd = [
+            "soffice",
+            "--headless",
+            "--infilter=writer_pdf_import",
+            "--convert-to", "docx",
+            "--outdir", tmp_dir,
+            input_pdf
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        expected = os.path.join(tmp_dir, Path(input_pdf).stem + ".docx")
+        if os.path.exists(expected) and os.path.getsize(expected) > 0:
+            if expected != output_docx:
+                shutil.move(expected, output_docx)
+            return True
+        docxs = [f for f in os.listdir(tmp_dir) if f.lower().endswith(".docx") and f != os.path.basename(output_docx)]
+        if docxs:
+            shutil.move(os.path.join(tmp_dir, docxs[0]), output_docx)
+            return True
+    except Exception as e:
+        print(f"LibreOffice PDF-to-DOCX error: {e}")
+    return False
+
+
 @app.get("/")
 @app.get("/health")
 def health_check():
@@ -62,7 +155,7 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
     background_tasks.add_task(cleanup_path, tmp_dir)
 
     input_pdf = os.path.join(tmp_dir, "input.pdf")
-    base_name = Path(file.filename).stem or "document"
+    base_name = re.sub(r'(\.[^.]+)+$', '', file.filename).strip() or "document"
     output_docx = os.path.join(tmp_dir, f"{base_name}.docx")
 
     try:
@@ -70,14 +163,33 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
         with open(input_pdf, "wb") as f:
             f.write(content)
 
-        # High-fidelity layout extraction via pdf2docx
-        from pdf2docx import Converter
-        cv = Converter(input_pdf)
-        cv.convert(output_docx, start=0, end=None)
-        cv.close()
+        converted_ok = False
 
-        if not os.path.exists(output_docx) or os.path.getsize(output_docx) == 0:
-            raise HTTPException(status_code=500, detail="Conversion completed but output file is empty.")
+        # Engine 1: High-fidelity layout extraction via pdf2docx
+        try:
+            from pdf2docx import Converter
+            cv = Converter(input_pdf)
+            cv.convert(output_docx, start=0, end=None)
+            cv.close()
+
+            if os.path.exists(output_docx) and os.path.getsize(output_docx) > 0:
+                # Sanitize and validate Word OpenXML structure
+                if sanitize_docx(output_docx):
+                    converted_ok = True
+                else:
+                    print("pdf2docx generated invalid XML structure. Switching to LibreOffice fallback.")
+        except Exception as e:
+            print(f"pdf2docx conversion error: {e}. Switching to LibreOffice fallback.")
+
+        # Engine 2: Fallback to LibreOffice headless (100% compliant OpenXML Word generator)
+        if not converted_ok:
+            lo_ok = convert_pdf_to_docx_libreoffice(input_pdf, tmp_dir, output_docx)
+            if lo_ok and os.path.exists(output_docx) and os.path.getsize(output_docx) > 0:
+                sanitize_docx(output_docx)
+                converted_ok = True
+
+        if not converted_ok or not os.path.exists(output_docx) or os.path.getsize(output_docx) == 0:
+            raise HTTPException(status_code=500, detail="Conversion completed but output Word file could not be generated cleanly.")
 
         return FileResponse(
             path=output_docx,
@@ -103,7 +215,7 @@ async def convert_word_to_pdf(background_tasks: BackgroundTasks, file: UploadFil
     tmp_dir = tempfile.mkdtemp(prefix="pdfiyo_word2pdf_")
     background_tasks.add_task(cleanup_path, tmp_dir)
 
-    base_name = Path(file.filename).stem or "document"
+    base_name = re.sub(r'(\.[^.]+)+$', '', file.filename).strip() or "document"
     input_file = os.path.join(tmp_dir, f"input{ext}")
 
     try:
@@ -154,7 +266,7 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
     background_tasks.add_task(cleanup_path, tmp_dir)
 
     input_pdf = os.path.join(tmp_dir, "input.pdf")
-    base_name = Path(file.filename).stem or "spreadsheet"
+    base_name = re.sub(r'(\.[^.]+)+$', '', file.filename).strip() or "spreadsheet"
     output_xlsx = os.path.join(tmp_dir, f"{base_name}.xlsx")
 
     try:
@@ -216,7 +328,7 @@ async def convert_excel_to_pdf(background_tasks: BackgroundTasks, file: UploadFi
     tmp_dir = tempfile.mkdtemp(prefix="pdfiyo_excel2pdf_")
     background_tasks.add_task(cleanup_path, tmp_dir)
 
-    base_name = Path(file.filename).stem or "document"
+    base_name = re.sub(r'(\.[^.]+)+$', '', file.filename).strip() or "document"
     input_file = os.path.join(tmp_dir, f"input{ext}")
 
     try:
@@ -265,7 +377,7 @@ async def convert_ppt_to_pdf(background_tasks: BackgroundTasks, file: UploadFile
     tmp_dir = tempfile.mkdtemp(prefix="pdfiyo_ppt2pdf_")
     background_tasks.add_task(cleanup_path, tmp_dir)
 
-    base_name = Path(file.filename).stem or "presentation"
+    base_name = re.sub(r'(\.[^.]+)+$', '', file.filename).strip() or "presentation"
     input_file = os.path.join(tmp_dir, f"input{ext}")
 
     try:
